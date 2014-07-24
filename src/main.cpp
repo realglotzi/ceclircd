@@ -32,6 +32,7 @@ using namespace log4cplus;
 using std::cout;
 using std::cerr;
 using std::endl;
+using std::hex;
 using std::min;
 using std::string;
 using std::stringstream;
@@ -113,32 +114,48 @@ int Main::onCecKeyPress(const cec_keypress &key) {
 	LOG4CPLUS_DEBUG(logger, "Main::onCecKeyPress(" << key << ")");
 
 	int repeat = 0;
+	stringstream s;
+	stringstream code;
 
 	std::map<cec_user_control_code, const char *>::const_iterator it;
 
+        if(key.duration > repeat_time)                                                                                                       
+                repeat = 1; 
+        else
+                repeat = 0;
+
+	code << "@0x" << hex << key.keycode;
+                                           
 	it = Cec::cecUserControlCodeName.find(key.keycode);
 	if (it == Cec::cecUserControlCodeName.end()) {
-		it = Cec::cecUserControlCodeName.find(CEC_USER_CONTROL_CODE_UNKNOWN);
-		assert(it != Cec::cecUserControlCodeName.end());
+//		it = Cec::cecUserControlCodeName.find(CEC_USER_CONTROL_CODE_UNKNOWN);
+//		assert(it != Cec::cecUserControlCodeName.end());
+		s << code << " " << repeat << " " << code << " RPICEC" << endl;
+	} else {
+		s << code << " " << repeat << " " << string(it->second) << " RPICEC" << endl;
 	}	
 
-	if(key.duration > repeat_time)
-		repeat++;
-	else 
-		repeat = 0;
-		
-	stringstream s;
-	s << key.keycode << " " << repeat << " " << string(it->second) << " RPICEC" << endl;
-	
-	if (key.duration == 0) {
+//	if (key.duration != 0) {
 		mylirc.processevent(s.str().c_str());
-	}
+//	}
 
 	return 1;
 }
 
 int Main::onCecCommand(const cec_command & command) {
 	LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(" << command << ")");
+	stringstream s;
+
+	switch (command.opcode) {
+		case CEC_OPCODE_PLAY:
+		case CEC_OPCODE_DECK_CONTROL:
+		case CEC_OPCODE_STANDBY:
+			s << command.opcode << " 0 " << command.opcode << " RPICEC" << endl;
+			mylirc.processevent(s.str().c_str());
+			break;
+		default:
+			;
+	}	
 	return 1;
 }
 
@@ -158,10 +175,10 @@ int main (int argc, char *argv[]) {
 	bool foreground = false;
 	bool list = false;
 	bool dontactivate = false;
-	int repeat_time = 0;
+	int repeat_time = 500;
 	string lircpath;
 	
-	while((opt = getopt(argc, argv, "hVflv:ar")) != -1) {
+	while((opt = getopt(argc, argv, "hVflv:ari:")) != -1) {
         switch(opt) {
 			case 'd':
 				lircpath = string(optarg);
@@ -185,7 +202,15 @@ int main (int argc, char *argv[]) {
 			case 'V':
 			case 'h':
             default:
-				cout << "Usage: " << argv[0] << " [options] " << endl << endl;
+		cout << "Usage: " << argv[0] << " [options] " << endl << endl;
+		cout << "Options:" << endl;
+		cout << "\t-d <socket> UNIX socket. The default is /var/run/lirc/lircd." << endl;
+		cout << "\t-f Run in the foreground." << endl;
+		cout << "\t-l list cec devices" << endl;
+		cout << "\t-a do not activate" << endl;
+		cout << "\t-r <rate> Repeat rate in ms. (Default is 500ms)" << endl;
+		cout << "\t-v <num> log level" << endl;
+		cout << "\t-t <path> Path to translation table." << endl;
                 return 0;
         }
     }

@@ -119,7 +119,7 @@ long lirc::time_elapsed(struct timeval *last, struct timeval *current) {
 }
 
 void lirc::processevent(const char *message) {
-	LOG4CPLUS_TRACE_STR(logger, "processevent start " + string(message));
+	LOG4CPLUS_TRACE_STR(logger, "lirc::processevent start " + string(message));
 
 #ifdef UNUSED
 	IRMP_DATA event;
@@ -165,7 +165,6 @@ void lirc::processevent(const char *message) {
 	
 	previous_input = current;
 	for(client = clients; client; client = client->next) {
-		printf ("processevent clients\n");
 		if(write(client->fd, message, len) != len) {
 			close(client->fd);
 			client->fd = -1;
@@ -173,7 +172,6 @@ void lirc::processevent(const char *message) {
 	}
 
 	for(prev = NULL, client = clients; client; client = next) {
-		printf ("processevent clean\n");
 		next = client->next;
 		if(client->fd < 0) {
 			if(prev)
