@@ -52,13 +52,12 @@ DIST=../dist
 DISTSRC=../distsrc
 ODIR=../OBJS
 EXE=ceclircd
-CXXFLAGS= -std=c++11 -D VERSION=\"$(VERSION)\" -g -Wall -Woverloaded-virtual -I $(PREFIX)/include -I .
+CXXFLAGS=-std=c++0x -D VERSION=\"$(VERSION)\" -g -Wall -Woverloaded-virtual -I $(PREFIX)/include -I .
 LFLAGS= -g -L$(PREFIX)/opt/vc/lib
 
 LIBS = -llog4cplus -lcec -ldl -lbcm_host -lvcos -lvchiq_arm
 
-#OBJS = lirc.o lircmain.o
-OBJS = main.o libcec.o lirc.o
+OBJS = main.o libcec.o lirc.o hdmi.o
 	
 all: $(EXE)
 

@@ -44,6 +44,7 @@
 #include <syslog.h>
 #include <pwd.h>
 #include <ctype.h>
+#include <thread>
 
 using std::string;
 
@@ -76,4 +77,10 @@ public:
 	void processnewclient(void);
 	void processevent(const char *);
 	void main_loop(void);
+	
+    std::thread spawn() {
+      return std::move(
+        std::thread( [this] { this->main_loop(); } )
+      );
+	}	  
 };

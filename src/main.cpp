@@ -7,6 +7,7 @@
  *
  */
 #include "main.h"
+#include "hdmi.h"
 
 #define CEC_NAME    "RaspberryPI"
 
@@ -19,8 +20,13 @@
 #include <cstdint>
 #include <cstddef>
 #include <csignal>
+#include <cstdlib>
 #include <vector>
 #include <unistd.h>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <thread>
 
 #include <log4cplus/logger.h>
 #include <log4cplus/loggingmacros.h>
@@ -37,8 +43,28 @@ using std::min;
 using std::string;
 using std::stringstream;
 using std::vector;
+using std::queue;
+using std::list;
+using std::mutex;
+using std::lock_guard;
+using std::condition_variable;
 
 static Logger logger = Logger::getInstance("main");
+static mutex libcec_sync;
+static condition_variable libcec_cond;
+
+const vector<list<string>> Main::uinputCecMap = Main::setupUinputMap();
+
+enum
+{
+	COMMAND_STANDBY,
+	COMMAND_ACTIVE,
+	COMMAND_INACTIVE,
+	COMMAND_RESTART,
+	COMMAND_KEYPRESS,
+	COMMAND_KEYRELEASE,
+	COMMAND_EXIT,
+};
 
 Main & Main::instance() {
 	// Singleton pattern so we can use main from a sighandle
@@ -46,11 +72,10 @@ Main & Main::instance() {
 	return main;
 }
 
-Main::Main() : cec(getCecName(), this), repeat_time(0), makeActive(true), running(true) {
+Main::Main() : cec(getCecName(), this), 
+	makeActive(true), running(false), lastUInputKeys({ }), logicalAddress(CECDEVICE_UNKNOWN) {
 	LOG4CPLUS_TRACE_STR(logger, "Main::Main()");
 
-	signal (SIGINT,  &Main::signalHandler);
-	signal (SIGTERM, &Main::signalHandler);
 }
 
 Main::~Main() {
@@ -58,30 +83,138 @@ Main::~Main() {
 	stop();
 }
 
-void Main::loop() {
+void Main::loop(const string & device) {
 	LOG4CPLUS_TRACE_STR(logger, "Main::loop()");
 
-	cec.open();
+	struct sigaction action;
 
-	if (makeActive) {
-		cec.makeActive();
-	}
+	action.sa_handler = &Main::signalHandler;
+	action.sa_flags = SA_RESETHAND;
+	sigemptyset(&action.sa_mask);
 
-	if (mylirc.Open()) {
-		while (running) {
-			mylirc.main_loop();
+	int restart = false;
+
+	do
+	{
+		cec.open(device);
+		if (!mylirc.Open()) {
+				/* reset signals */
+			signal (SIGHUP,  SIG_DFL);
+			signal (SIGINT,  SIG_DFL);
+			signal (SIGTERM, SIG_DFL);
+
+			cec.close(!restart);
+			
+			return;
 		}
-	}
 
-	mylirc.Close();
-	cec.close();
+		running = true;
+
+		/* install signals */
+		sigaction (SIGHUP,  &action, NULL);
+		sigaction (SIGINT,  &action, NULL);
+		sigaction (SIGTERM, &action, NULL);
+
+		if (makeActive) 
+		{
+			cec.makeActive();
+		}
+		
+//		std::thread t (&lirc::main_loop, &mylirc);
+		mylirc.main_loop();
+		
+		do
+		{
+			lock_guard<mutex> lock(libcec_sync);
+
+			while( running && !commands.empty() )
+			{
+				Command cmd = commands.front();
+				switch( cmd.command )
+				{
+					case COMMAND_STANDBY:
+						if( ! onStandbyCommand.empty() )
+						{
+							LOG4CPLUS_DEBUG(logger, "Standby: Running \"" << onStandbyCommand << "\"");
+							int ret = system(onStandbyCommand.c_str());
+                            if( ret )
+                                LOG4CPLUS_ERROR(logger, "Standby command failed: " << ret);
+							
+						}
+						else
+						{
+							onCecKeyPress( CEC_USER_CONTROL_CODE_POWER );
+						}
+						break;
+					case COMMAND_ACTIVE:
+						makeActive = true;
+						if( ! onActivateCommand.empty() )
+						{
+							LOG4CPLUS_DEBUG(logger, "Activated: Running \"" << onActivateCommand << "\"");
+							int ret = system(onActivateCommand.c_str());
+                            if( ret )
+                                LOG4CPLUS_ERROR(logger, "Activate command failed: " << ret);
+						}
+						break;
+					case COMMAND_INACTIVE:
+						makeActive = false;
+						if( ! onDeactivateCommand.empty() )
+						{
+							LOG4CPLUS_DEBUG(logger, "Deactivated: Running \"" << onDeactivateCommand << "\"");
+							int ret = system(onDeactivateCommand.c_str());
+                            if( ret )
+                                LOG4CPLUS_ERROR(logger, "Deactivate command failed: " << ret);
+						}
+						break;
+					case COMMAND_KEYPRESS:
+						onCecKeyPress( cmd.keycode );
+						break;
+					case COMMAND_RESTART:
+						running = false;
+						restart = true;
+						break;
+					case COMMAND_EXIT:
+						running = false;
+						break;
+				}
+				commands.pop();
+			}
+
+//			while( running && !libcec_cond.wait_for(libcec_sync std::chrono::seconds(43)) )
+//			{
+//				running = cec.ping();
+//			}
+		}
+		while( running );
+
+		/* reset signals */
+		signal (SIGHUP,  SIG_DFL);
+		signal (SIGINT,  SIG_DFL);
+		signal (SIGTERM, SIG_DFL);
+
+		cec.close(!restart);
+		mylirc.Close();
+	}
+	while( restart );
+}
+
+void Main::push(Command cmd) {
+	lock_guard<mutex> lock(libcec_sync);
+	if( running )
+	{
+		commands.push(cmd);
+		libcec_cond.notify_one();
+	}
 }
 
 void Main::stop() {
 	LOG4CPLUS_TRACE_STR(logger, "Main::stop()");
+	push(Command(COMMAND_EXIT));
+}
 
-	mylirc.Close();
-	running = false;
+void Main::restart() {
+	LOG4CPLUS_TRACE_STR(logger, "Main::restart()");
+	push(Command(COMMAND_RESTART));
 }
 
 void Main::listDevices() {
@@ -91,8 +224,15 @@ void Main::listDevices() {
 
 void Main::signalHandler(int sigNum) {
 	LOG4CPLUS_DEBUG_STR(logger, "Main::signalHandler()");
-	
-	Main::instance().stop();
+	switch( sigNum )
+	{
+		case SIGHUP:
+			Main::instance().restart();
+			break;
+		default:
+			Main::instance().stop();
+			break;
+	}
 }
 
 char *Main::getCecName() {
@@ -105,65 +245,329 @@ char *Main::getCecName() {
 	return cec_name;
 }
 
+const std::vector<list<string>> & Main::setupUinputMap() {
+	static std::vector<list<string>> uinputCecMap;
+
+	if (uinputCecMap.empty()) {
+		uinputCecMap.resize(CEC_USER_CONTROL_CODE_MAX + 1, {});
+		uinputCecMap[CEC_USER_CONTROL_CODE_SELECT                      ] = { "KEY_OK" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_UP                          ] = { "KEY_UP" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_DOWN                        ] = { "KEY_DOWN" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_LEFT                        ] = { "KEY_LEFT" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_RIGHT                       ] = { "KEY_RIGHT" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_RIGHT_UP                    ] = { "KEY_RIGHT", "KEY_UP" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_RIGHT_DOWN                  ] = { "KEY_RIGHT", "KEY_DOWN" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_LEFT_UP                     ] = { "KEY_LEFT", "KEY_UP" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_LEFT_DOWN                   ] = { "KEY_RIGHT", "KEY_UP" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_ROOT_MENU                   ] = { "KEY_HOME" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_SETUP_MENU                  ] = { "KEY_SETUP" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_CONTENTS_MENU               ] = { "KEY_MENU" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_FAVORITE_MENU               ] = { "KEY_FAVORITES" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_EXIT                        ] = { "KEY_EXIT" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_NUMBER0                     ] = { "KEY_0" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_NUMBER1                     ] = { "KEY_1" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_NUMBER2                     ] = { "KEY_2" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_NUMBER3                     ] = { "KEY_3" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_NUMBER4                     ] = { "KEY_4" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_NUMBER5                     ] = { "KEY_5" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_NUMBER6                     ] = { "KEY_6" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_NUMBER7                     ] = { "KEY_7" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_NUMBER8                     ] = { "KEY_8" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_NUMBER9                     ] = { "KEY_9" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_DOT                         ] = { "KEY_DOT" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_ENTER                       ] = { "KEY_ENTER" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_CLEAR                       ] = { "KEY_BACKSPACE" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_NEXT_FAVORITE               ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_CHANNEL_UP                  ] = { "KEY_CHANNELUP" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_CHANNEL_DOWN                ] = { "KEY_CHANNELDOWN" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_PREVIOUS_CHANNEL            ] = { "KEY_PREVIOUS" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_SOUND_SELECT                ] = { "KEY_SOUND" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_INPUT_SELECT                ] = { "KEY_TUNER" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_DISPLAY_INFORMATION         ] = { "KEY_INFO" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_HELP                        ] = { "KEY_HELP" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_PAGE_UP                     ] = { "KEY_PAGEUP" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_PAGE_DOWN                   ] = { "KEY_PAGEDOWN" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_POWER                       ] = { "KEY_POWER" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_VOLUME_UP                   ] = { "KEY_VOLUMEUP" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_VOLUME_DOWN                 ] = { "KEY_VOLUMEDOWN" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_MUTE                        ] = { "KEY_MUTE" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_PLAY                        ] = { "KEY_PLAY" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_STOP                        ] = { "KEY_STOP" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_PAUSE                       ] = { "KEY_PAUSE" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_RECORD                      ] = { "KEY_RECORD" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_REWIND                      ] = { "KEY_REWIND" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_FAST_FORWARD                ] = { "KEY_FASTFORWARD" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_EJECT                       ] = { "KEY_EJECTCD" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_FORWARD                     ] = { "KEY_FORWARD" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_BACKWARD                    ] = { "KEY_BACK" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_STOP_RECORD                 ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_PAUSE_RECORD                ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_ANGLE                       ] = { "KEY_SCREEN" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_SUB_PICTURE                 ] = { "KEY_SUBTITLE" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_VIDEO_ON_DEMAND             ] = { "KEY_VIDEO" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_ELECTRONIC_PROGRAM_GUIDE    ] = { "KEY_EPG" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_TIMER_PROGRAMMING           ] = { "KEY_TIME" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_INITIAL_CONFIGURATION       ] = { "KEY_CONFIG" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_PLAY_FUNCTION               ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_PAUSE_PLAY_FUNCTION         ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_RECORD_FUNCTION             ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_PAUSE_RECORD_FUNCTION       ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_STOP_FUNCTION               ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_MUTE_FUNCTION               ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_RESTORE_VOLUME_FUNCTION     ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_TUNE_FUNCTION               ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_SELECT_MEDIA_FUNCTION       ] = { "KEY_MEDIA" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_SELECT_AV_INPUT_FUNCTION    ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_SELECT_AUDIO_INPUT_FUNCTION ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_POWER_TOGGLE_FUNCTION       ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_POWER_OFF_FUNCTION          ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_POWER_ON_FUNCTION           ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_F1_BLUE                     ] = { "KEY_BLUE" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_F2_RED                      ] = { "KEY_RED" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_F3_GREEN                    ] = { "KEY_GREEN" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_F4_YELLOW                   ] = { "KEY_YELLOW" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_F5                          ] = { ""};
+		uinputCecMap[CEC_USER_CONTROL_CODE_DATA                        ] = { "KEY_TEXT" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_AN_RETURN                   ] = { "KEY_ESC" };
+		uinputCecMap[CEC_USER_CONTROL_CODE_AN_CHANNELS_LIST            ] = { "KEY_LIST" };
+	}
+
+	return uinputCecMap;
+}
+
 int Main::onCecLogMessage(const cec_log_message &message) {
 	LOG4CPLUS_DEBUG(logger, "Main::onCecLogMessage(" << message << ")");
 	return 1;
 }
 
+void Main::writeLirc(const cec_keypress &key, const string &keyString, const bool &repeat) {
+	stringstream s;
+
+	s << "" << hex << key.keycode << " " << repeat << " " << keyString << " RPICEC" << endl;
+	mylirc.processevent(s.str().c_str());
+
+}
+
 int Main::onCecKeyPress(const cec_keypress &key) {
 	LOG4CPLUS_DEBUG(logger, "Main::onCecKeyPress(" << key << ")");
 
-	int repeat = 0;
-	stringstream s;
-	stringstream code;
+	// Check bounds and find uinput code for this cec keypress
+	if (key.keycode >= 0 && key.keycode <= CEC_USER_CONTROL_CODE_MAX) {
+		const list<string> & uinputKeys = uinputCecMap[key.keycode];
 
-	std::map<cec_user_control_code, const char *>::const_iterator it;
+		if ( !uinputKeys.empty() ) {
+			if( key.duration == 0 ) {
+				if( uinputKeys == lastUInputKeys )
+				{
+					/*
+					** KEY REPEAT
+					*/
+					for (std::list<string>::const_iterator ukeys = uinputKeys.begin(); ukeys != uinputKeys.end(); ++ukeys) {
+						string ukey = *ukeys;
 
-        if(key.duration > repeat_time)                                                                                                       
-                repeat = 1; 
-        else
-                repeat = 0;
+						LOG4CPLUS_DEBUG(logger, "repeat " << ukey);
 
-	code << "@0x" << hex << key.keycode;
-                                           
-	it = Cec::cecUserControlCodeName.find(key.keycode);
-	if (it == Cec::cecUserControlCodeName.end()) {
-//		it = Cec::cecUserControlCodeName.find(CEC_USER_CONTROL_CODE_UNKNOWN);
-//		assert(it != Cec::cecUserControlCodeName.end());
-		s << code << " " << repeat << " " << code << " RPICEC" << endl;
-	} else {
-		s << code << " " << repeat << " " << string(it->second) << " RPICEC" << endl;
-	}	
+						// uinput.send_event(EV_KEY, ukey, EV_KEY_REPEAT);
+						writeLirc(key, ukey, 1);
+					}
+				}
+				else
+				{
+					/*
+					** KEY PRESSED
+					*/
+					if( ! lastUInputKeys.empty() )
+					{
+						/* what happened with the last key release ? */
+						for (std::list<string>::const_iterator ukeys = lastUInputKeys.begin(); ukeys != lastUInputKeys.end(); ++ukeys) {
+							string ukey = *ukeys;
 
-//	if (key.duration != 0) {
-		mylirc.processevent(s.str().c_str());
-//	}
+							LOG4CPLUS_DEBUG(logger, "release " << ukey);
+
+//							uinput.send_event(EV_KEY, ukey, EV_KEY_RELEASED);
+							writeLirc(key, ukey, 0);
+						}
+					}
+					for (std::list<string>::const_iterator ukeys = uinputKeys.begin(); ukeys != uinputKeys.end(); ++ukeys) {
+						string ukey = *ukeys;
+
+						LOG4CPLUS_DEBUG(logger, "send " << ukey);
+
+//						uinput.send_event(EV_KEY, ukey, EV_KEY_PRESSED);
+						writeLirc(key, ukey, 0);
+
+					}
+					lastUInputKeys = uinputKeys;
+				}
+			}
+			else {
+				if( lastUInputKeys != uinputKeys ) {
+					if( ! lastUInputKeys.empty() ) {
+						/* what happened with the last key release ? */
+						for (std::list<string>::const_iterator ukeys = lastUInputKeys.begin(); ukeys != lastUInputKeys.end(); ++ukeys) {
+							string ukey = *ukeys;
+
+							LOG4CPLUS_DEBUG(logger, "release " << ukey);
+
+//							uinput.send_event(EV_KEY, ukey, EV_KEY_RELEASED);
+							writeLirc(key, ukey, 0);
+						}
+					}
+					for (std::list<string>::const_iterator ukeys = uinputKeys.begin(); ukeys != uinputKeys.end(); ++ukeys) {
+						string ukey = *ukeys;
+
+						LOG4CPLUS_DEBUG(logger, "send " << ukey);
+
+//						uinput.send_event(EV_KEY, ukey, EV_KEY_PRESSED);
+						writeLirc(key, ukey, 0);
+
+					}
+//					boost::this_thread::sleep(boost::posix_time::milliseconds(100));
+				}
+				/*
+				** KEY RELEASED
+				*/
+				for (std::list<string>::const_iterator ukeys = uinputKeys.begin(); ukeys != uinputKeys.end(); ++ukeys) {
+					string ukey = *ukeys;
+
+					LOG4CPLUS_DEBUG(logger, "release " << ukey);
+
+//					uinput.send_event(EV_KEY, ukey, EV_KEY_RELEASED);
+					writeLirc(key, ukey, 0);
+
+				}
+				lastUInputKeys.clear();
+			}
+		}
+	}
+
+	return 1;
+}
+
+int Main::onCecKeyPress(const cec_user_control_code & keycode) {
+	cec_keypress key = { .keycode=keycode };
+
+	/* PUSH KEY */
+	key.duration = 0;
+	onCecKeyPress( key );
+
+	/* simulate delay */
+	key.duration = 100;
+//	usleep(key.duration);
+//	boost::this_thread::sleep(boost::posix_time::milliseconds(key.duration));
+
+	/* RELEASE KEY */
+	onCecKeyPress( key );
 
 	return 1;
 }
 
 int Main::onCecCommand(const cec_command & command) {
 	LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(" << command << ")");
-	stringstream s;
-
-	switch (command.opcode) {
-		case CEC_OPCODE_PLAY:
-		case CEC_OPCODE_DECK_CONTROL:
+	switch( command.opcode )
+	{
 		case CEC_OPCODE_STANDBY:
-			s << command.opcode << " 0 " << command.opcode << " RPICEC" << endl;
-			mylirc.processevent(s.str().c_str());
+//			if( (command.initiator == CECDEVICE_TV)
+//                         && ( (command.destination == CECDEVICE_BROADCAST) || (command.destination == logicalAddress))  )
+//			{
+				push(Command(COMMAND_STANDBY));
+//			}
+			break;
+		case CEC_OPCODE_REQUEST_ACTIVE_SOURCE:
+//			if( (command.initiator == CECDEVICE_TV)
+//                        && ( (command.destination == CECDEVICE_BROADCAST) || (command.destination == logicalAddress))  )
+//			{
+                if( makeActive )
+                {
+                    /* remind TV we are active */
+                    push(Command(COMMAND_ACTIVE));
+                }
+//			}
+		case CEC_OPCODE_SET_MENU_LANGUAGE:
+//			if( (command.initiator == CECDEVICE_TV) && (command.parameters.size == 3)
+//                         && ( (command.destination == CECDEVICE_BROADCAST) || (command.destination == logicalAddress))  )
+//			{
+				/* TODO */
+//			}
+			break;
+		case CEC_OPCODE_DECK_CONTROL:
+//			if( (command.initiator == CECDEVICE_TV) && (command.parameters.size == 1)
+//                         && ( (command.destination == CECDEVICE_BROADCAST) || (command.destination == logicalAddress))  )
+//			{
+				if( command.parameters[0] == CEC_DECK_CONTROL_MODE_STOP ) {
+					push(Command(COMMAND_KEYPRESS, CEC_USER_CONTROL_CODE_STOP));
+				}
+//			}
+			break;
+		case CEC_OPCODE_PLAY:
+			LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(CEC_OPCODE_PLAY)");
+//			if( (command.initiator == CECDEVICE_TV) && (command.parameters.size == 1)
+//                         && ( (command.destination == CECDEVICE_BROADCAST) || (command.destination == logicalAddress))  )
+//			{
+				if( command.parameters[0] == CEC_PLAY_MODE_PLAY_FORWARD ) {
+					push(Command(COMMAND_KEYPRESS, CEC_USER_CONTROL_CODE_PLAY));
+				}
+				else if( command.parameters[0] == CEC_PLAY_MODE_PLAY_STILL ) {
+					push(Command(COMMAND_KEYPRESS, CEC_USER_CONTROL_CODE_PAUSE));
+				} else
+					push(Command(COMMAND_KEYPRESS, CEC_USER_CONTROL_CODE_PLAY));
+//			}
 			break;
 		default:
-			;
-	}	
+			LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(UNKONWN)");
+			break;
+	}
 	return 1;
 }
 
+int Main::onCecAlert(const CEC::libcec_alert alert, const CEC::libcec_parameter & param) {
+	LOG4CPLUS_ERROR(logger, "Main::onCecAlert(alert=" << alert << ")");
+	switch( alert )
+	{
+		case CEC_ALERT_SERVICE_DEVICE:
+			break;
+		case CEC_ALERT_CONNECTION_LOST:
+		case CEC_ALERT_PERMISSION_ERROR:
+		case CEC_ALERT_PORT_BUSY:
+		case CEC_ALERT_PHYSICAL_ADDRESS_ERROR:
+		case CEC_ALERT_TV_POLL_FAILED:
+			Main::instance().restart();
+			break;
+		default:
+			break;
+	}
+	return 1;
+}
 
 int Main::onCecConfigurationChanged(const libcec_configuration & configuration) {
-	LOG4CPLUS_DEBUG(logger, "Main::onCecConfigurationChanged(" << configuration << ")");
+	//LOG4CPLUS_DEBUG(logger, "Main::onCecConfigurationChanged(" << configuration << ")");
+	LOG4CPLUS_DEBUG(logger, "Main::onCecConfigurationChanged(logicalAddress=" << configuration.logicalAddresses.primary << ")");
+	logicalAddress = configuration.logicalAddresses.primary;
 	return 1;
 }
+
+
+int Main::onCecMenuStateChanged(const cec_menu_state & menu_state) {
+	LOG4CPLUS_DEBUG(logger, "Main::onCecMenuStateChanged(" << menu_state << ")");
+
+	return onCecKeyPress(CEC_USER_CONTROL_CODE_CONTENTS_MENU);
+}
+
+void Main::onCecSourceActivated(const cec_logical_address & address, bool bActivated) {
+	LOG4CPLUS_DEBUG(logger, "Main::onCecSourceActivated(logicalAddress " << address << " = " << bActivated << ")");
+	if( logicalAddress == address )
+	{
+		if( bActivated )
+		{
+			push(Command(COMMAND_ACTIVE));
+		}
+		else
+		{	
+			push(Command(COMMAND_INACTIVE));
+		}
+	}
+}
+
 
 int main (int argc, char *argv[]) {
 
@@ -231,12 +635,13 @@ int main (int argc, char *argv[]) {
 	try {
 		// Create the main
 		Main & main = Main::instance();
+        string device = "";
 
 		if (dontactivate) {
 			main.setMakeActive(false);
 		}
 
-		main.setRepeatTime(repeat_time);
+//		main.setRepeatTime(repeat_time);
 		
 		if (!lircpath.empty()) {
 			main.setLircPath(lircpath);
@@ -251,7 +656,7 @@ int main (int argc, char *argv[]) {
 			daemon(0, 0);
 		}
 
-		main.loop();
+		main.loop(device);
 
 	} catch (std::exception & e) {
 		cerr << e.what() << endl;

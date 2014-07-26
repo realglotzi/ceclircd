@@ -15,6 +15,7 @@
  *
  */
 #include "libcec.h"
+#include "hdmi.h"
 
 #include <cstdio>
 #include <iostream>
@@ -30,9 +31,9 @@ using namespace CEC;
 using namespace log4cplus;
 
 using std::endl;
-using std::hex;
 using std::map;
 using std::ostream;
+using std::string;
 
 // cecloader has to be after some #includes and using namespaces :(
 using std::cout;
@@ -41,11 +42,13 @@ using std::cerr;
 
 static Logger logger = Logger::getInstance("libcec");
 
+#define MAX_CEC_PORTS (CEC_MAX_HDMI_PORTNUMBER-CEC_MIN_HDMI_PORTNUMBER)
+
 // Map of control codes to Strings
 const map<enum cec_user_control_code, const char *> Cec::cecUserControlCodeName = Cec::setupUserControlCodeName();
 
 // We store a global handle, so we can use g_cec->ToString(..) in certain cases. This is a bit of a HACK :(
-ICECAdapter * g_cec = NULL;
+static ICECAdapter * g_cec = NULL;
 
 int cecLogMessage(void *cbParam, const cec_log_message message) {
 	try {
@@ -68,11 +71,31 @@ int cecCommand(void *cbParam, const cec_command command) {
 	return 0;
 }
 
+int cecAlert(void *cbParam, const libcec_alert alert, const libcec_parameter param) {
+	try {
+		return ((CecCallback*) cbParam)->onCecAlert(alert, param);
+	} catch (...) {}
+	return 0;
+}
+
 int cecConfigurationChanged(void *cbParam, const libcec_configuration configuration) {
 	try {
 		return ((CecCallback*) cbParam)->onCecConfigurationChanged(configuration);
 	} catch (...) {}
 	return 0;
+}
+
+int cecMenuStateChanged(void *cbParam, const cec_menu_state menu_state) {
+	try {
+		return ((CecCallback*) cbParam)->onCecMenuStateChanged(menu_state);
+	} catch (...) {}
+	return 0;
+}
+
+void cecSourceActivated(void *cbParam, const cec_logical_address address, const uint8_t val) {
+	try {
+		return ((CecCallback*) cbParam)->onCecSourceActivated(address, val);
+	} catch (...) {}
 }
 
 struct ICECAdapterDeleter : std::default_delete<ICECAdapter> {
@@ -108,48 +131,68 @@ public:
 	}
 };
 
-ICECAdapter * Cec::CecInit(const char * name, CecCallback * callback) {
+Cec::Cec(const char * name, CecCallback * callback)
+{
 	assert(name != NULL);
 	assert(callback != NULL);
 
 	config.Clear();
 
-	config.deviceTypes.Add(CEC_DEVICE_TYPE_RECORDING_DEVICE);
+	config.clientVersion = CEC_CLIENT_VERSION_CURRENT;
+
 	strncpy(config.strDeviceName, name, sizeof(config.strDeviceName));
+	config.deviceTypes.Add(CEC_DEVICE_TYPE_RECORDING_DEVICE);
+	config.bAutodetectAddress = CEC_DEFAULT_SETTING_AUTODETECT_ADDRESS;
+	config.iPhysicalAddress = CEC_INVALID_PHYSICAL_ADDRESS;
+	config.baseDevice = CECDEVICE_UNKNOWN;
+	config.iHDMIPort = CEC_HDMI_PORTNUMBER_NONE;
+	config.bUseTVMenuLanguage = 0;
+	config.bActivateSource = 0;
+	config.bPowerOffScreensaver = 0;
+	config.bPowerOnScreensaver = 0;
+	config.bSendInactiveSource = 0;
+	config.bPowerOffOnStandby = 0;
+	config.bShutdownOnStandby = 0;
+	config.iDoubleTapTimeoutMs = 0;
 
 	callbacks.CBCecLogMessage           = &::cecLogMessage;
 	callbacks.CBCecKeyPress             = &::cecKeyPress;
 	callbacks.CBCecCommand              = &::cecCommand;
 	callbacks.CBCecConfigurationChanged = &::cecConfigurationChanged;
+	callbacks.CBCecAlert                = &::cecAlert;
+	callbacks.CBCecMenuStateChanged     = &::cecMenuStateChanged;
+	callbacks.CBCecSourceActivated      = &::cecSourceActivated;
 	config.callbackParam                = callback;
 	config.callbacks                    = &callbacks;
-	config.bActivateSource              = false;
-
-	// LibCecInitialise is noisy, so we redirect cout to nowhere
-	RedirectStreamBuffer redirect(cout, 0);
-	return g_cec = (ICECAdapter *)LibCecInitialise(&config);
-}
-
-Cec::Cec(const char * name, CecCallback * callback) :
-	cec(CecInit(name, callback), ICECAdapterDeleter())
-{
-	if (cec == NULL) {
-		throw std::runtime_error("Failed to initialise libCEC");
-	}
-	cec->InitVideoStandalone();
 }
 
 Cec::~Cec() {}
 
+void Cec::init()
+{
+    if (! cec)
+    {
+        // LibCecInitialise is noisy, so we redirect cout to nowhere
+        RedirectStreamBuffer redirect(cout, 0);
+        g_cec = LibCecInitialise(&config);
+        if (! g_cec) {
+            throw std::runtime_error("Failed to initialise libCEC");
+        }
+        cec = std::unique_ptr<CEC::ICECAdapter>(g_cec, ICECAdapterDeleter());
+        cec->InitVideoStandalone();
+    }
+}
 
-void Cec::open() {
+void Cec::open(const std::string &name) {
 	LOG4CPLUS_TRACE_STR(logger, "Cec::open()");
+	int id = 0;
 
-	assert(cec != NULL);
+	init();
 
 	// Search for adapters
-	cec_adapter devices[10];
-	uint8_t ret = cec->FindAdapters(devices, 10, NULL);
+	cec_adapter devices[MAX_CEC_PORTS];
+
+	uint8_t ret = cec->FindAdapters(devices, MAX_CEC_PORTS, NULL);
 	if (ret < 0) {
 		throw std::runtime_error("Error occurred searching for adapters");
 	}
@@ -158,26 +201,63 @@ void Cec::open() {
 		throw std::runtime_error("No adapters found");
 	}
 
+	if( ! name.empty() )
+	{
+        LOG4CPLUS_INFO(logger, "Looking for " << name);
+		for(id=0; id<ret; ++id)
+		{
+			if( name.compare(devices[id].path) == 0 )
+				break;
+			if( name.compare(devices[id].comm) == 0 )
+				break;
+		}
+		if( id == ret )
+		{
+			throw std::runtime_error("adapter not found");
+		}
+	}
+
 	// Just use the first found
-	if (!cec->Open(devices[0].comm)) {
+	LOG4CPLUS_INFO(logger, "Openning " << devices[id].path);
+
+	if (!cec->Open(devices[id].comm)) {
 		throw std::runtime_error("Failed to open adapter");
 	}
 
-	LOG4CPLUS_INFO(logger, "Opened " << devices[0].path);
+	LOG4CPLUS_INFO(logger, "Opened " << devices[id].path);
 }
 
-void Cec::close() {
-	cec->SetInactiveView();
-	cec->Close();
+void Cec::close(bool makeInactive) {
+	assert(cec);
+
+    if (makeInactive)
+        cec->SetInactiveView();
+    cec->Close();
+}
+
+void Cec::setTargetAddress(const HDMI::address & address) {
+	LOG4CPLUS_INFO(logger, "Physical Address is set to " << address.physical);
+    config.iPhysicalAddress = address.physical;
+	LOG4CPLUS_INFO(logger, "Base device is set to " << address.logical);
+	config.baseDevice = address.logical;
+	LOG4CPLUS_INFO(logger, "HDMI port is set to " << (int)address.port);
+	config.iHDMIPort = address.port;
 }
 
 void Cec::makeActive() {
+	assert(cec);
+
 	// and made active
 	if (!cec->SetActiveSource(config.deviceTypes[0])) {
 		throw std::runtime_error("Failed to become active");
 	}
 }
 
+bool Cec::ping() {
+	assert(cec);
+
+    return cec->PingAdapter();
+}
 
 
 /**
@@ -185,8 +265,11 @@ void Cec::makeActive() {
  * This will close any open device!
  */
 ostream & Cec::listDevices(ostream & out) {
-	cec_adapter devices[10];
-	int8_t ret = cec->FindAdapters(devices, 10, NULL);
+	cec_adapter devices[MAX_CEC_PORTS];
+
+    init();
+
+	int8_t ret = cec->FindAdapters(devices, MAX_CEC_PORTS, NULL);
 	if (ret < 0) {
 		LOG4CPLUS_ERROR(logger, "Error occurred searching for adapters");
 		return out;
@@ -208,12 +291,12 @@ ostream & Cec::listDevices(ostream & out) {
 			if (devices[j]) {
 				cec_logical_address logical_addres = (cec_logical_address) j;
 
-				uint16_t physical_address = cec->GetDevicePhysicalAddress(logical_addres);
+                HDMI::physical_address physical_address(cec->GetDevicePhysicalAddress(logical_addres));
 				cec_osd_name name = cec->GetDeviceOSDName(logical_addres);
 				cec_vendor_id vendor = (cec_vendor_id) cec->GetDeviceVendorId(logical_addres);
 
 				out << "\t"  << cec->ToString(logical_addres)
-				    << "@0x" << hex << physical_address
+				    << "@"  << physical_address
 				    << " "   << name.name << " (" << cec->ToString(vendor) << ")"
 				    << endl;
 			}
@@ -226,6 +309,86 @@ map<cec_user_control_code, const char *> & Cec::setupUserControlCodeName() {
 	static map<cec_user_control_code, const char *> cecUserControlCodeName;
 
 	if (cecUserControlCodeName.empty()) {
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_SELECT]="SELECT";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_UP]="UP";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_DOWN]="DOWN";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_LEFT]="LEFT";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_RIGHT]="RIGHT";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_RIGHT_UP]="RIGHT_UP";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_RIGHT_DOWN]="RIGHT_DOWN";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_LEFT_UP]="LEFT_UP";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_LEFT_DOWN]="LEFT_DOWN";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_ROOT_MENU]="ROOT_MENU";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_SETUP_MENU]="SETUP_MENU";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_CONTENTS_MENU]="CONTENTS_MENU";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_FAVORITE_MENU]="FAVORITE_MENU";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_EXIT]="EXIT";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_NUMBER0]="NUMBER0";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_NUMBER1]="NUMBER1";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_NUMBER2]="NUMBER2";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_NUMBER3]="NUMBER3";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_NUMBER4]="NUMBER4";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_NUMBER5]="NUMBER5";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_NUMBER6]="NUMBER6";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_NUMBER7]="NUMBER7";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_NUMBER8]="NUMBER8";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_NUMBER9]="NUMBER9";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_DOT]="DOT";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_ENTER]="ENTER";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_CLEAR]="CLEAR";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_NEXT_FAVORITE]="NEXT_FAVORITE";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_CHANNEL_UP]="CHANNEL_UP";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_CHANNEL_DOWN]="CHANNEL_DOWN";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_PREVIOUS_CHANNEL]="PREVIOUS_CHANNEL";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_SOUND_SELECT]="SOUND_SELECT";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_INPUT_SELECT]="INPUT_SELECT";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_DISPLAY_INFORMATION]="DISPLAY_INFORMATION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_HELP]="HELP";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_PAGE_UP]="PAGE_UP";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_PAGE_DOWN]="PAGE_DOWN";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_POWER]="POWER";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_VOLUME_UP]="VOLUME_UP";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_VOLUME_DOWN]="VOLUME_DOWN";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_MUTE]="MUTE";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_PLAY]="PLAY";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_STOP]="STOP";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_PAUSE]="PAUSE";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_RECORD]="RECORD";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_REWIND]="REWIND";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_FAST_FORWARD]="FAST_FORWARD";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_EJECT]="EJECT";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_FORWARD]="FORWARD";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_BACKWARD]="BACKWARD";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_STOP_RECORD]="STOP_RECORD";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_PAUSE_RECORD]="PAUSE_RECORD";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_ANGLE]="ANGLE";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_SUB_PICTURE]="SUB_PICTURE";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_VIDEO_ON_DEMAND]="VIDEO_ON_DEMAND";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_ELECTRONIC_PROGRAM_GUIDE]="ELECTRONIC_PROGRAM_GUIDE";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_TIMER_PROGRAMMING]="TIMER_PROGRAMMING";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_INITIAL_CONFIGURATION]="INITIAL_CONFIGURATION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_PLAY_FUNCTION]="PLAY_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_PAUSE_PLAY_FUNCTION]="PAUSE_PLAY_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_RECORD_FUNCTION]="RECORD_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_PAUSE_RECORD_FUNCTION]="PAUSE_RECORD_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_STOP_FUNCTION]="STOP_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_MUTE_FUNCTION]="MUTE_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_RESTORE_VOLUME_FUNCTION]="RESTORE_VOLUME_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_TUNE_FUNCTION]="TUNE_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_SELECT_MEDIA_FUNCTION]="SELECT_MEDIA_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_SELECT_AV_INPUT_FUNCTION]="SELECT_AV_INPUT_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_SELECT_AUDIO_INPUT_FUNCTION]="SELECT_AUDIO_INPUT_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_POWER_TOGGLE_FUNCTION]="POWER_TOGGLE_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_POWER_OFF_FUNCTION]="POWER_OFF_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_POWER_ON_FUNCTION]="POWER_ON_FUNCTION";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_F1_BLUE]="F1_BLUE";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_F2_RED]="F2_RED";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_F3_GREEN]="F3_GREEN";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_F4_YELLOW]="F4_YELLOW";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_F5]="F5";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_DATA]="DATA";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_AN_RETURN]="AN_RETURN";
+		cecUserControlCodeName[CEC_USER_CONTROL_CODE_AN_CHANNELS_LIST]="AN_CHANNELS_LIST";
 		cecUserControlCodeName[CEC_USER_CONTROL_CODE_UNKNOWN]="UNKNOWN";
 	}
 
@@ -276,12 +439,21 @@ std::ostream& operator<<(std::ostream &out, const cec_command & cmd) {
 //  int8_t              opcode_set;       /**< 1 when an opcode is set, 0 otherwise (POLL message) */
 //  int32_t             transmit_timeout; /**< the timeout to use in ms */
 
-	return out << "Command " << cmd.initiator << " to " << cmd.destination << " " << cmd.opcode;
+	return out << "Command "
+			<< cmd.initiator << "->" << cmd.destination
+			<< "[" << (cmd.ack ? "A" : " ") << (cmd.eom ? "A" : " ") << "]"
+			<< " " << cmd.opcode;
 }
 
 std::ostream& operator<<(std::ostream &out, const cec_opcode & opcode) {
 	if (g_cec)
 		return out << g_cec->ToString(opcode);
+	return out << "UNKNOWN";
+}
+
+std::ostream& operator<<(std::ostream &out, const cec_logical_address & address) {
+	if (g_cec)
+		return out << g_cec->ToString(address);
 	return out << "UNKNOWN";
 }
 
