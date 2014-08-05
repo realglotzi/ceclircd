@@ -1,12 +1,17 @@
 /*
-    irmplircd -- zeroconf LIRC daemon that reads IRMP events from the USB IR Remote Receiver
-	             http://www.mikrocontroller.net/articles/USB_IR_Remote_Receiver
-    Copyright (C) 2011-2012  Dirk E. Wagner
+    ceclircd -- LIRC daemon that reads CEC events from libcec
+                https://github.com/Pulse-Eight/libcec
+				
+    Copyright (c) 2014 Dirk E. Wagner
 
-	based on:
+    based on:
     inputlircd -- zeroconf LIRC daemon that reads from /dev/input/event devices
-    Copyright (C) 2006  Guus Sliepen <guus@sliepen.eu.org>
-
+    Copyright (c) 2006  Guus Sliepen <guus@sliepen.eu.org>
+	
+    libcec-daemon -- A Linux daemon for connecting libcec to uinput.
+    Copyright (c) 2012-2013, Andrew Brampton
+    https://github.com/bramp/libcec-daemon
+	
     This program is free software; you can redistribute it and/or modify it
     under the terms of version 2 of the GNU General Public License as published
     by the Free Software Foundation.
@@ -20,6 +25,7 @@
     along with this program; if not, write to the Free Software
     Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 */
+
 #pragma once
 
 #include <string>
@@ -44,7 +50,7 @@
 #include <syslog.h>
 #include <pwd.h>
 #include <ctype.h>
-#include <thread>
+#include <pthread.h>
 
 using std::string;
 
@@ -62,7 +68,8 @@ private:
 	int repeat = 0;
 	
 	void* xalloc(size_t size);
-	long time_elapsed(struct timeval *last, struct timeval *current);
+	pthread_t lirc_thread;
+	bool isRunning;
 	
 public:
 	bool grab = false;
@@ -78,9 +85,4 @@ public:
 	void processevent(const char *);
 	void main_loop(void);
 	
-    std::thread spawn() {
-      return std::move(
-        std::thread( [this] { this->main_loop(); } )
-      );
-	}	  
 };

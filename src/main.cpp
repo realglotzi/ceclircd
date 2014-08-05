@@ -1,11 +1,31 @@
-/**
- * libcec-daemon
- * A simple daemon to connect libcec to uinput. That is, using your TV to control your PC! 
- * by Andrew Brampton
- *
- * TODO
- *
- */
+/*
+    ceclircd -- LIRC daemon that reads CEC events from libcec
+                https://github.com/Pulse-Eight/libcec
+				
+    Copyright (c) 2014 Dirk E. Wagner
+
+    based on:
+    inputlircd -- zeroconf LIRC daemon that reads from /dev/input/event devices
+    Copyright (c) 2006  Guus Sliepen <guus@sliepen.eu.org>
+	
+    libcec-daemon -- A Linux daemon for connecting libcec to uinput.
+    Copyright (c) 2012-2013, Andrew Brampton
+    https://github.com/bramp/libcec-daemon
+	
+    This program is free software; you can redistribute it and/or modify it
+    under the terms of version 2 of the GNU General Public License as published
+    by the Free Software Foundation.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
+*/
+
 #include "main.h"
 #include "hdmi.h"
 
@@ -23,10 +43,8 @@
 #include <cstdlib>
 #include <vector>
 #include <unistd.h>
-#include <mutex>
-#include <condition_variable>
-#include <chrono>
-#include <thread>
+#include <pthread.h>
+#include <sys/time.h>
 
 #include <log4cplus/logger.h>
 #include <log4cplus/loggingmacros.h>
@@ -45,14 +63,10 @@ using std::stringstream;
 using std::vector;
 using std::queue;
 using std::list;
-using std::mutex;
-using std::lock_guard;
-using std::condition_variable;
 
 static Logger logger = Logger::getInstance("main");
-static mutex libcec_sync;
-static condition_variable libcec_cond;
-
+static pthread_mutex_t libcec_sync = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  libcec_cond = PTHREAD_COND_INITIALIZER;
 const vector<list<string>> Main::uinputCecMap = Main::setupUinputMap();
 
 enum
@@ -80,11 +94,19 @@ Main::Main() : cec(getCecName(), this),
 
 Main::~Main() {
 	LOG4CPLUS_TRACE_STR(logger, "Main::~Main()");
-	stop();
+
+//	stop();
+
+	pthread_cond_destroy (&libcec_cond);                                                                                         
+	pthread_mutex_destroy (&libcec_sync);                                                                                              
+  
 }
 
 void Main::loop(const string & device) {
 	LOG4CPLUS_TRACE_STR(logger, "Main::loop()");
+
+	struct timeval now;                                                                                                  
+	struct timespec timeout;
 
 	struct sigaction action;
 
@@ -102,7 +124,8 @@ void Main::loop(const string & device) {
 			signal (SIGHUP,  SIG_DFL);
 			signal (SIGINT,  SIG_DFL);
 			signal (SIGTERM, SIG_DFL);
-
+			signal (SIGPIPE, SIG_DFL);
+			
 			cec.close(!restart);
 			
 			return;
@@ -114,19 +137,16 @@ void Main::loop(const string & device) {
 		sigaction (SIGHUP,  &action, NULL);
 		sigaction (SIGINT,  &action, NULL);
 		sigaction (SIGTERM, &action, NULL);
-
+		sigaction (SIGPIPE, &action, NULL);
+		
 		if (makeActive) 
 		{
 			cec.makeActive();
 		}
 		
-//		std::thread t (&lirc::main_loop, &mylirc);
-		mylirc.main_loop();
-		
 		do
 		{
-			lock_guard<mutex> lock(libcec_sync);
-
+			pthread_mutex_lock( &libcec_sync );
 			while( running && !commands.empty() )
 			{
 				Command cmd = commands.front();
@@ -170,20 +190,24 @@ void Main::loop(const string & device) {
 						onCecKeyPress( cmd.keycode );
 						break;
 					case COMMAND_RESTART:
+						LOG4CPLUS_DEBUG(logger, "COMMAND_RESTART");
 						running = false;
 						restart = true;
 						break;
 					case COMMAND_EXIT:
+						LOG4CPLUS_DEBUG(logger, "COMMAND_EXIT");
 						running = false;
 						break;
 				}
 				commands.pop();
 			}
 
-//			while( running && !libcec_cond.wait_for(libcec_sync std::chrono::seconds(43)) )
-//			{
-//				running = cec.ping();
-//			}
+			gettimeofday(&now, NULL);
+			timeout.tv_sec = now.tv_sec + 1;
+			timeout.tv_nsec = now.tv_usec * 1000;
+
+			pthread_cond_timedwait(&libcec_cond, &libcec_sync, &timeout);
+			pthread_mutex_unlock( &libcec_sync );
 		}
 		while( running );
 
@@ -191,7 +215,8 @@ void Main::loop(const string & device) {
 		signal (SIGHUP,  SIG_DFL);
 		signal (SIGINT,  SIG_DFL);
 		signal (SIGTERM, SIG_DFL);
-
+		signal (SIGPIPE, SIG_DFL);
+		
 		cec.close(!restart);
 		mylirc.Close();
 	}
@@ -199,12 +224,14 @@ void Main::loop(const string & device) {
 }
 
 void Main::push(Command cmd) {
-	lock_guard<mutex> lock(libcec_sync);
+	pthread_mutex_lock(&libcec_sync);
 	if( running )
 	{
 		commands.push(cmd);
-		libcec_cond.notify_one();
+		pthread_cond_signal(&libcec_cond);
+
 	}
+	pthread_mutex_unlock( &libcec_sync );
 }
 
 void Main::stop() {
@@ -224,8 +251,9 @@ void Main::listDevices() {
 
 void Main::signalHandler(int sigNum) {
 	LOG4CPLUS_DEBUG_STR(logger, "Main::signalHandler()");
-	switch( sigNum )
-	{
+	
+	switch( sigNum ) {
+		case SIGPIPE:
 		case SIGHUP:
 			Main::instance().restart();
 			break;
@@ -356,6 +384,35 @@ int Main::onCecKeyPress(const cec_keypress &key) {
 		const list<string> & uinputKeys = uinputCecMap[key.keycode];
 
 		if ( !uinputKeys.empty() ) {
+			if( key.duration == 0 || key.keycode == CEC_USER_CONTROL_CODE_AN_CHANNELS_LIST || key.keycode == CEC_USER_CONTROL_CODE_AN_RETURN) {
+				/*
+				** KEY PRESSED
+				*/
+				for (std::list<string>::const_iterator ukeys = uinputKeys.begin(); ukeys != uinputKeys.end(); ++ukeys) {
+					string ukey = *ukeys;
+
+					LOG4CPLUS_DEBUG(logger, "pressed " << ukey);
+					writeLirc(key, ukey, 0);
+
+				}
+				lastUInputKeys = uinputKeys;
+				
+			}
+		}
+	}
+
+	return 1;
+}
+
+#ifdef OLD
+int Main::onCecKeyPress(const cec_keypress &key) {
+	LOG4CPLUS_DEBUG(logger, "Main::onCecKeyPress(" << key << ")");
+
+	// Check bounds and find uinput code for this cec keypress
+	if (key.keycode >= 0 && key.keycode <= CEC_USER_CONTROL_CODE_MAX) {
+		const list<string> & uinputKeys = uinputCecMap[key.keycode];
+
+		if ( !uinputKeys.empty() ) {
 			if( key.duration == 0 ) {
 				if( uinputKeys == lastUInputKeys )
 				{
@@ -370,14 +427,11 @@ int Main::onCecKeyPress(const cec_keypress &key) {
 						// uinput.send_event(EV_KEY, ukey, EV_KEY_REPEAT);
 						writeLirc(key, ukey, 1);
 					}
-				}
-				else
-				{
+				} else {
 					/*
 					** KEY PRESSED
 					*/
-					if( ! lastUInputKeys.empty() )
-					{
+					if( ! lastUInputKeys.empty() ) {
 						/* what happened with the last key release ? */
 						for (std::list<string>::const_iterator ukeys = lastUInputKeys.begin(); ukeys != lastUInputKeys.end(); ++ukeys) {
 							string ukey = *ukeys;
@@ -399,8 +453,7 @@ int Main::onCecKeyPress(const cec_keypress &key) {
 					}
 					lastUInputKeys = uinputKeys;
 				}
-			}
-			else {
+			} else {
 				if( lastUInputKeys != uinputKeys ) {
 					if( ! lastUInputKeys.empty() ) {
 						/* what happened with the last key release ? */
@@ -423,6 +476,7 @@ int Main::onCecKeyPress(const cec_keypress &key) {
 
 					}
 //					boost::this_thread::sleep(boost::posix_time::milliseconds(100));
+					usleep(100);
 				}
 				/*
 				** KEY RELEASED
@@ -443,7 +497,7 @@ int Main::onCecKeyPress(const cec_keypress &key) {
 
 	return 1;
 }
-
+#endif
 int Main::onCecKeyPress(const cec_user_control_code & keycode) {
 	cec_keypress key = { .keycode=keycode };
 
@@ -453,8 +507,7 @@ int Main::onCecKeyPress(const cec_user_control_code & keycode) {
 
 	/* simulate delay */
 	key.duration = 100;
-//	usleep(key.duration);
-//	boost::this_thread::sleep(boost::posix_time::milliseconds(key.duration));
+	usleep(key.duration);
 
 	/* RELEASE KEY */
 	onCecKeyPress( key );
@@ -484,11 +537,11 @@ int Main::onCecCommand(const cec_command & command) {
                 }
 //			}
 		case CEC_OPCODE_SET_MENU_LANGUAGE:
-//			if( (command.initiator == CECDEVICE_TV) && (command.parameters.size == 3)
-//                         && ( (command.destination == CECDEVICE_BROADCAST) || (command.destination == logicalAddress))  )
-//			{
+			if( (command.initiator == CECDEVICE_TV) && (command.parameters.size == 3)
+                         && ( (command.destination == CECDEVICE_BROADCAST) || (command.destination == logicalAddress))  )
+			{
 				/* TODO */
-//			}
+			}
 			break;
 		case CEC_OPCODE_DECK_CONTROL:
 //			if( (command.initiator == CECDEVICE_TV) && (command.parameters.size == 1)
@@ -513,8 +566,11 @@ int Main::onCecCommand(const cec_command & command) {
 					push(Command(COMMAND_KEYPRESS, CEC_USER_CONTROL_CODE_PLAY));
 //			}
 			break;
+		case CEC_OPCODE_VENDOR_REMOTE_BUTTON_UP:
+			LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(CEC_OPCODE_VENDOR_REMOTE_BUTTON_UP)"); 
+			break;
 		default:
-			LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(UNKONWN)");
+			LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(UNKONWN) opcode=" << hex << command.opcode); 
 			break;
 	}
 	return 1;
@@ -575,14 +631,13 @@ int main (int argc, char *argv[]) {
     config.configure();
 
 	int opt;
-    int loglevel = 2;
+    	int loglevel = -1;
 	bool foreground = false;
 	bool list = false;
 	bool dontactivate = false;
-	int repeat_time = 500;
 	string lircpath;
 	
-	while((opt = getopt(argc, argv, "hVflv:ari:")) != -1) {
+	while((opt = getopt(argc, argv, "hVflv:ai:")) != -1) {
         switch(opt) {
 			case 'd':
 				lircpath = string(optarg);
@@ -600,9 +655,6 @@ int main (int argc, char *argv[]) {
 			case 'a':
 				dontactivate = true;
 				break;
-			case 'r':
-				repeat_time = atoi(optarg) * 1000L;
-				break;
 			case 'V':
 			case 'h':
             default:
@@ -612,7 +664,6 @@ int main (int argc, char *argv[]) {
 		cout << "\t-f Run in the foreground." << endl;
 		cout << "\t-l list cec devices" << endl;
 		cout << "\t-a do not activate" << endl;
-		cout << "\t-r <rate> Repeat rate in ms. (Default is 500ms)" << endl;
 		cout << "\t-v <num> log level" << endl;
 		cout << "\t-t <path> Path to translation table." << endl;
                 return 0;
@@ -641,8 +692,6 @@ int main (int argc, char *argv[]) {
 			main.setMakeActive(false);
 		}
 
-//		main.setRepeatTime(repeat_time);
-		
 		if (!lircpath.empty()) {
 			main.setLircPath(lircpath);
 		}

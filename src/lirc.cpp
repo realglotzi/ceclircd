@@ -1,12 +1,17 @@
 /*
-    irmplircd -- zeroconf LIRC daemon that reads IRMP events from the USB IR Remote Receiver
-	             http://www.mikrocontroller.net/articles/USB_IR_Remote_Receiver
-    Copyright (C) 2011-2012  Dirk E. Wagner
+    ceclircd -- LIRC daemon that reads CEC events from libcec
+                https://github.com/Pulse-Eight/libcec
+				
+    Copyright (c) 2014 Dirk E. Wagner
 
-	based on:
+    based on:
     inputlircd -- zeroconf LIRC daemon that reads from /dev/input/event devices
-    Copyright (C) 2006  Guus Sliepen <guus@sliepen.eu.org>
-
+    Copyright (c) 2006  Guus Sliepen <guus@sliepen.eu.org>
+	
+    libcec-daemon -- A Linux daemon for connecting libcec to uinput.
+    Copyright (c) 2012-2013, Andrew Brampton
+    https://github.com/bramp/libcec-daemon
+	
     This program is free software; you can redistribute it and/or modify it
     under the terms of version 2 of the GNU General Public License as published
     by the Free Software Foundation.
@@ -21,16 +26,23 @@
     Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 */
 
+#include <pthread.h>
+
 #include <log4cplus/logger.h>                                                                                 
 #include <log4cplus/loggingmacros.h>                                                                          
 
-#include "lirc.hpp"                                                                                                               
+#include "lirc.h"                                                                                                               
 
 using namespace log4cplus;                                                                                    
  
 static Logger logger = Logger::getInstance("lirc");        
+static pthread_mutex_t lirc_sync = PTHREAD_MUTEX_INITIALIZER;
 
-lirc::lirc() {
+extern "C" void *extf(void* This) {
+	static_cast<lirc*>(This)->main_loop();
+}
+
+lirc::lirc() : isRunning(false) {
 	device = string("/var/run/lirc/lircd");
 	gettimeofday(&previous_input, NULL);
 }
@@ -43,7 +55,7 @@ lirc::~lirc() {
 	void *buf = malloc(size);
 	if(!buf) {
 		fprintf(stderr, "Could not allocate %zd bytes with malloc(): %s\n", size, strerror(errno));
-		exit(EX_OSERR);
+		throw std::runtime_error("Error during malloc()");
 	}
 	memset(buf, 0, size);
 	return buf;
@@ -79,14 +91,31 @@ bool lirc::Open(void) {
 		return false;
 	}
 
+	if (pthread_create(&lirc_thread, NULL, &extf, this)) {
+        	fprintf(stderr, "Can't create lirc thread");
+        	return false;
+	}
+	
+	isRunning = true;
+	
 	return true;
 }
 
 bool lirc::Close() {                     
-	LOG4CPLUS_TRACE_STR(logger, "lirc::Close()");                                                                          
-        if (sockfd >= 0)                                                                                     
-                close (sockfd);                                                                              
+	LOG4CPLUS_TRACE_STR(logger, "lirc::Close()");
 	
+	isRunning = false;
+	
+	if (sockfd >= 0) {
+		LOG4CPLUS_TRACE_STR(logger, "lirc::Close() sockfd");
+		shutdown (sockfd, SHUT_RDWR);
+		close (sockfd);
+	}
+
+	pthread_mutex_destroy( &lirc_sync);
+	pthread_join(lirc_thread, NULL);
+	LOG4CPLUS_TRACE_STR(logger, "lirc::Close() lirc_thread terminated");
+
 	return true; 
 }     
 
@@ -94,16 +123,17 @@ void lirc::processnewclient(void) {
 	
 	LOG4CPLUS_TRACE_STR(logger, "lirc::processnewclient(void) start");
 	
+	pthread_mutex_lock( &lirc_sync );
+	
 	client_t *newclient = (client_t *)xalloc(sizeof *newclient);
 
 	newclient->fd = accept(sockfd, NULL, NULL);
 
 	if(newclient->fd < 0) {
 		free(newclient);
-		if(errno == ECONNABORTED || errno == EINTR)
-			return;
-		syslog(LOG_ERR, "Error during accept(): %s\n", strerror(errno));
-		exit(EX_OSERR);
+		pthread_mutex_unlock( &lirc_sync );
+		LOG4CPLUS_DEBUG_STR(logger, "lirc::processnewclient(void) - Error during accept(): " + string(strerror(errno)));
+		return;
 	}
 
 	int flags = fcntl(newclient->fd, F_GETFL);
@@ -111,54 +141,13 @@ void lirc::processnewclient(void) {
 	newclient->next = clients;
 	clients = newclient;
 	
-}
-
-long lirc::time_elapsed(struct timeval *last, struct timeval *current) {
-	long seconds = current->tv_sec - last->tv_sec;
-	return 1000000 * seconds + current->tv_usec - last->tv_usec;
+	pthread_mutex_unlock( &lirc_sync );
 }
 
 void lirc::processevent(const char *message) {
 	LOG4CPLUS_TRACE_STR(logger, "lirc::processevent start " + string(message));
 
-#ifdef UNUSED
-	IRMP_DATA event;
-	char hash_key[100];
-	char irmp_fulldata[100];
-	char message[100];
-	int len;
-	client_t *client, *prev, *next;
-
-	message[0]=0;
-	
-	if((len=read(evdev->fd, &event, sizeof event)) <= 0) {
-		syslog(LOG_ERR, "Error processing event from %s: %s\n", evdev->name, strerror(errno));
-		exit(EX_OSERR);
-	}
-
-	DBG ("dummy = 0x%02d, p = %02d, a = 0x%04x, c = 0x%04x, f = 0x%02x\n", event.dummy, event.protocol, event.address, event.command, event.flags);
-		
-	struct timeval current;
-	gettimeofday(&current, NULL);
-	if(time_elapsed(&previous_input, &current) < repeat_time)
-		repeat++;
-	else 
-		repeat = 0;
-
-	snprintf (irmp_fulldata, sizeof irmp_fulldata, "%02x%04x%04x%02x", event.protocol, event.address, event.command, event.flags);
-	snprintf (hash_key, sizeof hash_key, "%02x%04x%04x%02x", event.protocol, event.address, event.command, 0);
-
-	map_entry_t *map_entry;
-	
-	if(hashmap_get(mymap, hash_key, (void**)(&map_entry))==MAP_OK) {
-		DBG ("MAP_OK irmpd_fulldata=%s lirc=%s\n", irmp_fulldata, map_entry->value);	
-		len = snprintf(message, sizeof message, "%s %x %s %s\n",  irmp_fulldata, event.flags, map_entry->value, "IRMP");
-	} else {
-		DBG ("MAP_ERROR irmpd_fulldata=%s|\n", irmp_fulldata);	
-		len = snprintf(message, sizeof message, "%s %x %s %s\n",  irmp_fulldata, repeat, irmp_fulldata, "IRMP");
-	}
-#endif	
-
+	pthread_mutex_lock( &lirc_sync );
 	int len = strlen(message);
 	client_t *client, *prev, *next;
 	struct timeval current;
@@ -184,11 +173,12 @@ void lirc::processevent(const char *message) {
 		}
 	}
 
+	pthread_mutex_unlock( &lirc_sync );
 }
 
 void lirc::main_loop(void) {
 
-	LOG4CPLUS_TRACE_STR (logger, "main_loop");
+	LOG4CPLUS_TRACE_STR (logger, "main_loop start");
 	
 	fd_set fdset;
 	int maxfd = 0;
@@ -201,19 +191,21 @@ void lirc::main_loop(void) {
 
 	maxfd++;
 	
-	while(true) {
-		printf ("while(true)\n");
+	while(isRunning) {
+		LOG4CPLUS_TRACE_STR(logger, "lirc::main_loop() while entered");
 		
 		if(select(maxfd, &fdset, NULL, NULL, NULL) < 0) {
 			if(errno == EINTR)
 				continue;
 			syslog(LOG_ERR, "Error during select(): %s\n", strerror(errno));
-			exit(EX_OSERR);
+			throw std::runtime_error("Error during select()");
 		}
 
 		if(FD_ISSET(sockfd, &fdset))
 			processnewclient();
 			
 	}
+	
+	LOG4CPLUS_TRACE_STR(logger, "lirc::main_loop() end");
 }
 
