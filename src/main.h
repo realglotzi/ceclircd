@@ -62,7 +62,9 @@ class Main : public CecCallback {
 		bool running;
 
 		//
-		std::list<string> lastUInputKeys; // for key(s) repetition
+//		std::list<string> lastUInputKeys; // for key(s) repetition
+		CEC::cec_keypress lastKey;
+		int repeatCount;
 
 		//
 		Main();

@@ -87,7 +87,7 @@ Main & Main::instance() {
 }
 
 Main::Main() : cec(getCecName(), this), 
-	makeActive(true), running(false), lastUInputKeys({ }), logicalAddress(CECDEVICE_UNKNOWN) {
+	makeActive(true), running(false), repeatCount(0), logicalAddress(CECDEVICE_UNKNOWN) {
 	LOG4CPLUS_TRACE_STR(logger, "Main::Main()");
 
 }
@@ -369,6 +369,7 @@ int Main::onCecLogMessage(const cec_log_message &message) {
 }
 
 void Main::writeLirc(const cec_keypress &key, const string &keyString, const bool &repeat) {
+	LOG4CPLUS_DEBUG(logger, "Main::writeLirc() " << key);
 	stringstream s;
 
 	s << "" << hex << key.keycode << " " << repeat << " " << keyString << " RPICEC" << endl;
@@ -377,7 +378,7 @@ void Main::writeLirc(const cec_keypress &key, const string &keyString, const boo
 }
 
 int Main::onCecKeyPress(const cec_keypress &key) {
-	LOG4CPLUS_DEBUG(logger, "Main::onCecKeyPress(" << key << ")");
+	LOG4CPLUS_DEBUG(logger, "Main::onCecKeyPress(" << key << ") start");
 
 	// Check bounds and find uinput code for this cec keypress
 	if (key.keycode >= 0 && key.keycode <= CEC_USER_CONTROL_CODE_MAX) {
@@ -385,26 +386,43 @@ int Main::onCecKeyPress(const cec_keypress &key) {
 
 		if ( !uinputKeys.empty() ) {
 			if( key.duration == 0 || key.keycode == CEC_USER_CONTROL_CODE_AN_CHANNELS_LIST || key.keycode == CEC_USER_CONTROL_CODE_AN_RETURN) {
+				lastKey = key;
+
 				/*
 				** KEY PRESSED
 				*/
 				for (std::list<string>::const_iterator ukeys = uinputKeys.begin(); ukeys != uinputKeys.end(); ++ukeys) {
 					string ukey = *ukeys;
-
-					LOG4CPLUS_DEBUG(logger, "pressed " << ukey);
-					writeLirc(key, ukey, 0);
-
+					writeLirc(key, ukey, (repeatCount > 2));
 				}
-				lastUInputKeys = uinputKeys;
-				
 			}
+		}
+	}
+
+	LOG4CPLUS_DEBUG(logger, "Main::onCecKeyPress(" << key << ") end");
+	return 1;
+}
+#ifdef OLD
+int Main::onCecKeyPress(const cec_user_control_code & keycode) {
+	cec_keypress key = { .keycode=keycode };
+
+	// Check bounds and find uinput code for this cec keypress
+	if (key.keycode >= 0 && key.keycode <= CEC_USER_CONTROL_CODE_MAX) {
+		const list<string> & uinputKeys = uinputCecMap[key.keycode];
+
+		if ( !uinputKeys.empty() ) {
+				for (std::list<string>::const_iterator ukeys = uinputKeys.begin(); ukeys != uinputKeys.end(); ++ukeys) {
+					string ukey = *ukeys;
+
+					LOG4CPLUS_DEBUG(logger, "repeat " << ukey);
+					writeLirc(key, ukey, true);
+				}
 		}
 	}
 
 	return 1;
 }
 
-#ifdef OLD
 int Main::onCecKeyPress(const cec_keypress &key) {
 	LOG4CPLUS_DEBUG(logger, "Main::onCecKeyPress(" << key << ")");
 
@@ -498,6 +516,7 @@ int Main::onCecKeyPress(const cec_keypress &key) {
 	return 1;
 }
 #endif
+
 int Main::onCecKeyPress(const cec_user_control_code & keycode) {
 	cec_keypress key = { .keycode=keycode };
 
@@ -505,18 +524,13 @@ int Main::onCecKeyPress(const cec_user_control_code & keycode) {
 	key.duration = 0;
 	onCecKeyPress( key );
 
-	/* simulate delay */
-	key.duration = 100;
-	usleep(key.duration);
-
-	/* RELEASE KEY */
-	onCecKeyPress( key );
-
 	return 1;
 }
 
+
 int Main::onCecCommand(const cec_command & command) {
-	LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(" << command << ")");
+	LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(" << command << ") start");
+	
 	switch( command.opcode )
 	{
 		case CEC_OPCODE_STANDBY:
@@ -566,13 +580,27 @@ int Main::onCecCommand(const cec_command & command) {
 					push(Command(COMMAND_KEYPRESS, CEC_USER_CONTROL_CODE_PLAY));
 //			}
 			break;
+		case CEC_OPCODE_USER_CONTROL_PRESSED:
+			LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(CEC_OPCODE_USER_CONTROL_PRESSED)");
+			repeatCount = 0;
+			lastKey.keycode = CEC_USER_CONTROL_CODE_UNKNOWN;
+			break;
 		case CEC_OPCODE_VENDOR_REMOTE_BUTTON_UP:
-			LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(CEC_OPCODE_VENDOR_REMOTE_BUTTON_UP)"); 
+			LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(CEC_OPCODE_VENDOR_REMOTE_BUTTON_UP) repeatCount=" << repeatCount);
+			repeatCount++;
+			if (repeatCount > 2 && lastKey.keycode != CEC_USER_CONTROL_CODE_UNKNOWN) {
+				onCecKeyPress( lastKey.keycode );
+			} else {
+				LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(CEC_OPCODE_VENDOR_REMOTE_BUTTON_UP) code ignored");
+			}
 			break;
 		default:
 			LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(UNKONWN) opcode=" << hex << command.opcode); 
 			break;
 	}
+	
+	LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(" << command << ") end");
+
 	return 1;
 }
 
