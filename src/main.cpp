@@ -75,8 +75,6 @@ enum
 	COMMAND_ACTIVE,
 	COMMAND_INACTIVE,
 	COMMAND_RESTART,
-	COMMAND_KEYPRESS,
-	COMMAND_KEYRELEASE,
 	COMMAND_EXIT,
 };
 
@@ -185,9 +183,6 @@ void Main::loop(const string & device) {
                             if( ret )
                                 LOG4CPLUS_ERROR(logger, "Deactivate command failed: " << ret);
 						}
-						break;
-					case COMMAND_KEYPRESS:
-						onCecKeyPress( cmd.keycode );
 						break;
 					case COMMAND_RESTART:
 						LOG4CPLUS_DEBUG(logger, "COMMAND_RESTART");
@@ -402,120 +397,6 @@ int Main::onCecKeyPress(const cec_keypress &key) {
 	LOG4CPLUS_DEBUG(logger, "Main::onCecKeyPress(" << key << ") end");
 	return 1;
 }
-#ifdef OLD
-int Main::onCecKeyPress(const cec_user_control_code & keycode) {
-	cec_keypress key = { .keycode=keycode };
-
-	// Check bounds and find uinput code for this cec keypress
-	if (key.keycode >= 0 && key.keycode <= CEC_USER_CONTROL_CODE_MAX) {
-		const list<string> & uinputKeys = uinputCecMap[key.keycode];
-
-		if ( !uinputKeys.empty() ) {
-				for (std::list<string>::const_iterator ukeys = uinputKeys.begin(); ukeys != uinputKeys.end(); ++ukeys) {
-					string ukey = *ukeys;
-
-					LOG4CPLUS_DEBUG(logger, "repeat " << ukey);
-					writeLirc(key, ukey, true);
-				}
-		}
-	}
-
-	return 1;
-}
-
-int Main::onCecKeyPress(const cec_keypress &key) {
-	LOG4CPLUS_DEBUG(logger, "Main::onCecKeyPress(" << key << ")");
-
-	// Check bounds and find uinput code for this cec keypress
-	if (key.keycode >= 0 && key.keycode <= CEC_USER_CONTROL_CODE_MAX) {
-		const list<string> & uinputKeys = uinputCecMap[key.keycode];
-
-		if ( !uinputKeys.empty() ) {
-			if( key.duration == 0 ) {
-				if( uinputKeys == lastUInputKeys )
-				{
-					/*
-					** KEY REPEAT
-					*/
-					for (std::list<string>::const_iterator ukeys = uinputKeys.begin(); ukeys != uinputKeys.end(); ++ukeys) {
-						string ukey = *ukeys;
-
-						LOG4CPLUS_DEBUG(logger, "repeat " << ukey);
-
-						// uinput.send_event(EV_KEY, ukey, EV_KEY_REPEAT);
-						writeLirc(key, ukey, 1);
-					}
-				} else {
-					/*
-					** KEY PRESSED
-					*/
-					if( ! lastUInputKeys.empty() ) {
-						/* what happened with the last key release ? */
-						for (std::list<string>::const_iterator ukeys = lastUInputKeys.begin(); ukeys != lastUInputKeys.end(); ++ukeys) {
-							string ukey = *ukeys;
-
-							LOG4CPLUS_DEBUG(logger, "release " << ukey);
-
-//							uinput.send_event(EV_KEY, ukey, EV_KEY_RELEASED);
-							writeLirc(key, ukey, 0);
-						}
-					}
-					for (std::list<string>::const_iterator ukeys = uinputKeys.begin(); ukeys != uinputKeys.end(); ++ukeys) {
-						string ukey = *ukeys;
-
-						LOG4CPLUS_DEBUG(logger, "send " << ukey);
-
-//						uinput.send_event(EV_KEY, ukey, EV_KEY_PRESSED);
-						writeLirc(key, ukey, 0);
-
-					}
-					lastUInputKeys = uinputKeys;
-				}
-			} else {
-				if( lastUInputKeys != uinputKeys ) {
-					if( ! lastUInputKeys.empty() ) {
-						/* what happened with the last key release ? */
-						for (std::list<string>::const_iterator ukeys = lastUInputKeys.begin(); ukeys != lastUInputKeys.end(); ++ukeys) {
-							string ukey = *ukeys;
-
-							LOG4CPLUS_DEBUG(logger, "release " << ukey);
-
-//							uinput.send_event(EV_KEY, ukey, EV_KEY_RELEASED);
-							writeLirc(key, ukey, 0);
-						}
-					}
-					for (std::list<string>::const_iterator ukeys = uinputKeys.begin(); ukeys != uinputKeys.end(); ++ukeys) {
-						string ukey = *ukeys;
-
-						LOG4CPLUS_DEBUG(logger, "send " << ukey);
-
-//						uinput.send_event(EV_KEY, ukey, EV_KEY_PRESSED);
-						writeLirc(key, ukey, 0);
-
-					}
-//					boost::this_thread::sleep(boost::posix_time::milliseconds(100));
-					usleep(100);
-				}
-				/*
-				** KEY RELEASED
-				*/
-				for (std::list<string>::const_iterator ukeys = uinputKeys.begin(); ukeys != uinputKeys.end(); ++ukeys) {
-					string ukey = *ukeys;
-
-					LOG4CPLUS_DEBUG(logger, "release " << ukey);
-
-//					uinput.send_event(EV_KEY, ukey, EV_KEY_RELEASED);
-					writeLirc(key, ukey, 0);
-
-				}
-				lastUInputKeys.clear();
-			}
-		}
-	}
-
-	return 1;
-}
-#endif
 
 int Main::onCecKeyPress(const cec_user_control_code & keycode) {
 	cec_keypress key = { .keycode=keycode };
@@ -554,6 +435,7 @@ int Main::onCecCommand(const cec_command & command) {
 			if( (command.initiator == CECDEVICE_TV) && (command.parameters.size == 3)
                          && ( (command.destination == CECDEVICE_BROADCAST) || (command.destination == logicalAddress))  )
 			{
+				LOG4CPLUS_DEBUG(logger, "Main::onCecCommand(CEC_OPCODE_SET_MENU_LANGUAGE)");
 				/* TODO */
 			}
 			break;
@@ -562,7 +444,7 @@ int Main::onCecCommand(const cec_command & command) {
 //                         && ( (command.destination == CECDEVICE_BROADCAST) || (command.destination == logicalAddress))  )
 //			{
 				if( command.parameters[0] == CEC_DECK_CONTROL_MODE_STOP ) {
-					push(Command(COMMAND_KEYPRESS, CEC_USER_CONTROL_CODE_STOP));
+					onCecKeyPress(CEC_USER_CONTROL_CODE_STOP);
 				}
 //			}
 			break;
@@ -572,12 +454,13 @@ int Main::onCecCommand(const cec_command & command) {
 //                         && ( (command.destination == CECDEVICE_BROADCAST) || (command.destination == logicalAddress))  )
 //			{
 				if( command.parameters[0] == CEC_PLAY_MODE_PLAY_FORWARD ) {
-					push(Command(COMMAND_KEYPRESS, CEC_USER_CONTROL_CODE_PLAY));
+					onCecKeyPress(CEC_USER_CONTROL_CODE_PLAY);
 				}
 				else if( command.parameters[0] == CEC_PLAY_MODE_PLAY_STILL ) {
-					push(Command(COMMAND_KEYPRESS, CEC_USER_CONTROL_CODE_PAUSE));
-				} else
-					push(Command(COMMAND_KEYPRESS, CEC_USER_CONTROL_CODE_PLAY));
+					onCecKeyPress(CEC_USER_CONTROL_CODE_PAUSE);
+				} else {
+					onCecKeyPress(CEC_USER_CONTROL_CODE_PLAY);
+				}
 //			}
 			break;
 		case CEC_OPCODE_USER_CONTROL_PRESSED:
