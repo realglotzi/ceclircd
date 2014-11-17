@@ -177,7 +177,7 @@ Cec::Cec(const char * name, CecCallback * callback) {
 	config.bSendInactiveSource = 0;
 	config.bPowerOffOnStandby = 0;
 	config.bShutdownOnStandby = 0;
-	config.iDoubleTapTimeoutMs = 0;
+	config.iDoubleTapTimeout50Ms = 0;
 
 	callbacks.CBCecLogMessage           = &::cecLogMessage;
 	callbacks.CBCecKeyPress             = &::cecKeyPress;
